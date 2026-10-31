@@ -1,0 +1,273 @@
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Plugin } from 'vite'
+
+/* ──────────────────────────────────────────────────────────────
+   SkyShield Local Authentication Plugin
+   Works 100% locally — no cloud OAuth portal required.
+   Supports:
+     GET  /api/auth/login    – redirects to /?auth=open
+     POST /api/auth/login    – email + password sign-in
+     POST /api/auth/signup   – register a new account
+     POST /api/auth/google   – instant Google session (direct login)
+     GET  /api/auth/me       – read current session
+     POST /api/auth/logout   – clear session cookie
+   ────────────────────────────────────────────────────────────── */
+
+const SESSION_COOKIE = 'webdev_app_session'
+const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365
+const JWT_SECRET = process.env['MANUS_JWT_SECRET'] || 'skyshield-jwt-local-secret-key-2026-ops'
+const APP_ID = process.env['MANUS_PROJECT_ID'] || 'skyshield-local'
+const PW_HMAC_KEY = 'skyshield-pw'
+
+type UserRecord = {
+  name: string
+  email: string
+  role: string
+  loginMethod: string
+  passwordHash?: string
+}
+
+type SessionPayload = {
+  openId: string
+  appId: string
+  name: string
+  email?: string
+  loginMethod?: string
+  avatar?: string
+  role?: string
+  exp: number
+}
+
+// ── In-memory user store (seeded with a demo account) ──────────
+const userDb = new Map<string, UserRecord>()
+const demoHash = createHmac('sha256', PW_HMAC_KEY).update('skyShieldPass2026').digest('hex')
+userDb.set('ayam@skyshield.aero', {
+  name: 'Ayam Srivastava',
+  email: 'ayam@skyshield.aero',
+  role: 'Flight Safety Lead',
+  loginMethod: 'email',
+  passwordHash: demoHash
+})
+
+// ── JWT helpers ────────────────────────────────────────────────
+function b64url(data: string | Buffer): string {
+  return Buffer.from(data).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
+}
+
+function signJwt(payload: Omit<SessionPayload, 'exp'>): string {
+  const body: SessionPayload = { ...payload, exp: Math.floor(Date.now() / 1000) + ONE_YEAR_SECONDS }
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
+  const claims = b64url(JSON.stringify(body))
+  const sig = b64url(createHmac('sha256', JWT_SECRET).update(`${header}.${claims}`).digest())
+  return `${header}.${claims}.${sig}`
+}
+
+function verifyJwt(token: string | undefined): SessionPayload | null {
+  if (!token) return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  const [header, claims, sig] = parts
+  try {
+    const expected = createHmac('sha256', JWT_SECRET).update(`${header}.${claims}`).digest()
+    const received = Buffer.from(
+      sig.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - sig.length % 4) % 4),
+      'base64'
+    )
+    if (expected.length !== received.length || !timingSafeEqual(expected, received)) return null
+    const payload = JSON.parse(
+      Buffer.from(
+        claims.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - claims.length % 4) % 4),
+        'base64'
+      ).toString()
+    ) as SessionPayload
+    if (!payload.openId || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+// ── HTTP helpers ───────────────────────────────────────────────
+function parseCookies(header = ''): Record<string, string> {
+  return Object.fromEntries(
+    header.split(';').map(part => {
+      const idx = part.indexOf('=')
+      if (idx < 0) return ['', '']
+      return [part.slice(0, idx).trim(), decodeURIComponent(part.slice(idx + 1).trim())]
+    }).filter(([k]) => k)
+  )
+}
+
+function json(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    ...extraHeaders
+  })
+  res.end(JSON.stringify(value))
+}
+
+function requestOrigin(req: IncomingMessage): string {
+  const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim()
+    || ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')
+  const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost:3000')
+  return `${proto}://${host}`
+}
+
+async function readBody<T>(req: IncomingMessage): Promise<T | null> {
+  return new Promise(resolve => {
+    let data = ''
+    req.on('data', chunk => { data += chunk })
+    req.on('end', () => {
+      try { resolve(data ? JSON.parse(data) as T : null) }
+      catch { resolve(null) }
+    })
+    req.on('error', () => resolve(null))
+  })
+}
+
+function userId(email: string): string {
+  return `usr_${createHmac('md5', 'skyshield').update(email).digest('hex').slice(0, 12)}`
+}
+
+function setCookieHeader(token: string): string {
+  return `${SESSION_COOKIE}=${token}; Path=/; Max-Age=${ONE_YEAR_SECONDS}; SameSite=Lax`
+}
+
+// ── Route handler ──────────────────────────────────────────────
+async function handleAuth(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  const origin = requestOrigin(req)
+  const url = new URL(req.url ?? '/', origin)
+
+  if (!url.pathname.startsWith('/api/auth/')) return false
+
+  // ── GET /api/auth/login (Safety redirect to home if accessed directly) ──
+  if (url.pathname === '/api/auth/login' && req.method === 'GET') {
+    res.writeHead(302, { Location: '/?auth=open' })
+    res.end()
+    return true
+  }
+
+  // ── GET /api/auth/me ─────────────────────────────────────────
+  if (url.pathname === '/api/auth/me' && req.method === 'GET') {
+    const token = parseCookies(req.headers.cookie)[SESSION_COOKIE]
+    const session = verifyJwt(token)
+    if (!session) {
+      json(res, 200, { user: null })
+      return true
+    }
+    json(res, 200, {
+      user: {
+        openId: session.openId,
+        name: session.name,
+        email: session.email ?? null,
+        loginMethod: session.loginMethod ?? null,
+        avatar: session.avatar ?? null,
+        role: session.role ?? null
+      }
+    })
+    return true
+  }
+
+  // ── POST /api/auth/login ─────────────────────────────────────
+  if (url.pathname === '/api/auth/login' && req.method === 'POST') {
+    const body = await readBody<{ email?: string; password?: string }>(req)
+    const email = (body?.email ?? '').trim().toLowerCase()
+    const password = body?.password ?? ''
+
+    if (!email || !email.includes('@')) {
+      json(res, 400, { error: 'Please provide a valid email address.' })
+      return true
+    }
+    if (!password || password.length < 4) {
+      json(res, 400, { error: 'Password must be at least 4 characters.' })
+      return true
+    }
+
+    const record = userDb.get(email)
+    if (record?.passwordHash) {
+      const hash = createHmac('sha256', PW_HMAC_KEY).update(password).digest('hex')
+      if (hash !== record.passwordHash) {
+        json(res, 401, { error: 'Incorrect password. Please try again.' })
+        return true
+      }
+    }
+
+    const name = record?.name || email.split('@')[0].replace(/[._-]/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+    const role = record?.role || 'Safety Lead'
+    const openId = userId(email)
+    const token = signJwt({ openId, appId: APP_ID, name, email, loginMethod: 'email', role })
+
+    json(res, 200, { user: { openId, name, email, loginMethod: 'email', role } }, { 'Set-Cookie': setCookieHeader(token) })
+    return true
+  }
+
+  // ── POST /api/auth/signup ────────────────────────────────────
+  if (url.pathname === '/api/auth/signup' && req.method === 'POST') {
+    const body = await readBody<{ name?: string; email?: string; password?: string; role?: string }>(req)
+    const name = (body?.name ?? '').trim()
+    const email = (body?.email ?? '').trim().toLowerCase()
+    const password = body?.password ?? ''
+    const role = (body?.role ?? '').trim() || 'Flight Operations'
+
+    if (!name) { json(res, 400, { error: 'Please enter your full name.' }); return true }
+    if (!email || !email.includes('@')) { json(res, 400, { error: 'Please provide a valid email address.' }); return true }
+    if (password.length < 6) { json(res, 400, { error: 'Password must be at least 6 characters.' }); return true }
+
+    const passwordHash = createHmac('sha256', PW_HMAC_KEY).update(password).digest('hex')
+    userDb.set(email, { name, email, role, loginMethod: 'email', passwordHash })
+
+    const openId = userId(email)
+    const token = signJwt({ openId, appId: APP_ID, name, email, loginMethod: 'email', role })
+
+    json(res, 200, { user: { openId, name, email, loginMethod: 'email', role } }, { 'Set-Cookie': setCookieHeader(token) })
+    return true
+  }
+
+  // ── POST /api/auth/google ────────────────────────────────────
+  if (url.pathname === '/api/auth/google' && req.method === 'POST') {
+    const body = await readBody<{ name?: string; email?: string; avatar?: string }>(req)
+    const name = (body?.name ?? '').trim() || 'Ayam Srivastava'
+    const email = (body?.email ?? '').trim().toLowerCase() || 'ayam.srivastava@gmail.com'
+    const avatar = body?.avatar ?? ''
+
+    const openId = `goog_${createHmac('md5', 'skyshield').update(email).digest('hex').slice(0, 12)}`
+    const token = signJwt({ openId, appId: APP_ID, name, email, loginMethod: 'google', avatar, role: 'Flight Safety Lead' })
+
+    json(res, 200, {
+      user: { openId, name, email, loginMethod: 'google', avatar, role: 'Flight Safety Lead' }
+    }, { 'Set-Cookie': setCookieHeader(token) })
+    return true
+  }
+
+  // ── POST /api/auth/logout ────────────────────────────────────
+  if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
+    json(res, 200, { ok: true }, { 'Set-Cookie': `${SESSION_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax` })
+    return true
+  }
+
+  json(res, 404, { error: 'Auth route not found.' })
+  return true
+}
+
+// ── Vite plugin export ─────────────────────────────────────────
+function middleware(req: IncomingMessage, res: ServerResponse, next: () => void) {
+  void handleAuth(req, res)
+    .then(handled => { if (!handled) next() })
+    .catch(err => {
+      console.error('[SkyShield auth] request error', err)
+      if (!res.headersSent) json(res, 500, { error: 'Auth service error.' })
+    })
+}
+
+export function authPlugin(): Plugin {
+  return {
+    name: 'skyshield-auth',
+    configureServer(server) {
+      server.middlewares.use(middleware)
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(middleware)
+    }
+  }
+}

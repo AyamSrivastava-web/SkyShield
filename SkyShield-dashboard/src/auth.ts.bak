@@ -1,0 +1,104 @@
+export type AuthUser = {
+  openId: string
+  name: string
+  email: string | null
+  loginMethod: 'google' | 'email' | string | null
+  avatar?: string
+  role?: string
+}
+
+const STORAGE_KEY = 'skyshield_auth_user'
+
+export async function getCurrentUser(): Promise<AuthUser | null> {
+  try {
+    const response = await fetch('/api/auth/me', { credentials: 'include' })
+    if (response.ok) {
+      const data = await response.json() as { user?: AuthUser | null }
+      if (data.user) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data.user))
+        return data.user
+      }
+    }
+  } catch {
+    // Fall back to local storage
+  }
+
+  // Check localStorage fallback
+  const stored = localStorage.getItem(STORAGE_KEY)
+  if (stored) {
+    try {
+      return JSON.parse(stored) as AuthUser
+    } catch {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  }
+  return null
+}
+
+export async function loginWithEmail(email: string, password: string): Promise<AuthUser> {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ email, password })
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({})) as { error?: string }
+    throw new Error(errorData.error || 'Authentication failed. Please check your credentials.')
+  }
+
+  const data = await response.json() as { user: AuthUser }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data.user))
+  return data.user
+}
+
+export async function signUpWithEmail(name: string, email: string, password: string, role?: string): Promise<AuthUser> {
+  const response = await fetch('/api/auth/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ name, email, password, role })
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({})) as { error?: string }
+    throw new Error(errorData.error || 'Registration failed. Please check the details provided.')
+  }
+
+  const data = await response.json() as { user: AuthUser }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data.user))
+  return data.user
+}
+
+export async function loginWithGoogle(customUser?: { name?: string; email?: string; avatar?: string }): Promise<AuthUser> {
+  const response = await fetch('/api/auth/google', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(customUser || {})
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({})) as { error?: string }
+    throw new Error(errorData.error || 'Google login failed.')
+  }
+
+  const data = await response.json() as { user: AuthUser }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data.user))
+  return data.user
+}
+
+export function beginLogin(): void {
+  // Safe fallback if called by legacy code: dispatch an event to open AuthModal
+  window.dispatchEvent(new CustomEvent('skyshield:open-auth'))
+}
+
+export async function signOut(): Promise<void> {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+  } catch {
+    // Ignore network error during signout
+  }
+  localStorage.removeItem(STORAGE_KEY)
+}
